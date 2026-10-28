@@ -1,0 +1,786 @@
+# lom-ssg — A tiny static site generator written in Lom
+#
+# 第一个 Lom 真实应用：markdown 子集 → HTML。
+# 用法:
+#   lom build.lom -- <site.json>      构建站点（缺省回落 site.json）
+#
+# 流水线: site.json 配置 → front-matter 解析 → 块级 markdown（递归下降）
+#         → 行内 markdown（字符扫描）→ 模板变量替换 → file_write 输出
+#
+# 零依赖：仅用 43 内建（string/math/list/json/map/file/env/io）。
+# 注意: file 模块无目录列举（冻结面），页面清单由 site.json 的 pages 数组给出。
+
+from env import { args }
+from file import { file_read, file_write, file_exists }
+from json import { json_parse, json_stringify }
+from list import { list_empty, list_length, list_get, list_is_empty, list_head, list_tail, list_cons }
+from map import { map_empty, map_set, map_get, map_has }
+from string import { len, int_to_string, trim, split, contains, replace, starts_with, ends_with }
+from io import { println }
+
+# ============================================================
+# 一、字符串/字符基础（无 slice/index 内建，全部自实现）
+# ============================================================
+
+# 字符列表：split 空分隔符 = 逐字符（UTF-8 感知，多字节字符为单元素）
+fn chars_of(s: String) -> List<String>
+    split(s, "")
+end
+
+# 字符列表 → 字符串（[start, to) 区间拼接）
+fn chars_join(cs: List<String>, start: Int, to: Int, acc: String) -> String
+    if start >= to
+        acc
+    else
+        chars_join(cs, start + 1, to, acc + list_get(cs, start))
+    end
+end
+
+# 子串 [start, to)；越界收窄到 [0, len]
+fn slice(s: String, start: Int, to: Int) -> String
+    let n = len(s)
+    let f = if start < 0
+        0
+    else
+        start
+    end
+    let t = if to > n
+        n
+    else
+        to
+    end
+    chars_join(chars_of(s), f, t, "")
+end
+
+# 在字符区间 [start, to) 内找字符 c 的下标，找不到返回 -1
+fn chars_find(cs: List<String>, c: String, start: Int, to: Int) -> Int
+    if start >= to
+        -1
+    elif list_get(cs, start) == c
+        start
+    else
+        chars_find(cs, c, start + 1, to)
+    end
+end
+
+# 在字符区间内找两字符序列 a b（如 "](" 与 "**"），找不到返回 -1
+fn chars_find2(cs: List<String>, a: String, b: String, start: Int, to: Int) -> Int
+    if start + 1 >= to
+        -1
+    elif list_get(cs, start) == a
+        if list_get(cs, start + 1) == b
+            start
+        else
+            chars_find2(cs, a, b, start + 1, to)
+        end
+    else
+        chars_find2(cs, a, b, start + 1, to)
+    end
+end
+
+# 字符串行列表递归拼接（[start, to) 行以 sep 连接）
+fn lines_join(ls: List<String>, start: Int, to: Int, sep: String, acc: String) -> String
+    if start >= to
+        acc
+    elif start + 1 == to
+        acc + list_get(ls, start)
+    else
+        lines_join(ls, start + 1, to, sep, acc + list_get(ls, start) + sep)
+    end
+end
+
+# ============================================================
+# 二、HTML 转义（correctness 门：& < > " 必转）
+# ============================================================
+
+fn escape_char(c: String) -> String
+    if c == "&"
+        "&amp;"
+    elif c == "<"
+        "&lt;"
+    elif c == ">"
+        "&gt;"
+    elif c == "\""
+        "&quot;"
+    else
+        c
+    end
+end
+
+fn html_escape(s: String) -> String
+    html_escape_chars(chars_of(s), 0, len(s), "")
+end
+
+fn html_escape_chars(cs: List<String>, i: Int, n: Int, acc: String) -> String
+    if i >= n
+        acc
+    else
+        html_escape_chars(cs, i + 1, n, acc + escape_char(list_get(cs, i)))
+    end
+end
+
+# ============================================================
+# 三、行内 markdown（`code` / **bold** / *italic* / [t](u) / \x 转义）
+# ============================================================
+
+fn render_inline(s: String) -> String
+    inline_scan(chars_of(s), 0, len(s), "")
+end
+
+# 区间内子串完整行内渲染（bold/italic 内部递归用）
+fn render_inline_range(cs: List<String>, start: Int, to: Int) -> String
+    inline_scan(cs, start, to, "")
+end
+
+fn inline_scan(cs: List<String>, i: Int, n: Int, acc: String) -> String
+    if i >= n
+        acc
+    else
+        let c = list_get(cs, i)
+        if c == "\\"
+            inline_scan(cs, i + 2, n, acc + escape_after_backslash(cs, i, n))
+        elif c == "`"
+            inline_code(cs, i, n, acc)
+        elif c == "*"
+            if i + 1 < n
+                if list_get(cs, i + 1) == "*"
+                    inline_bold(cs, i, n, acc)
+                else
+                    inline_italic(cs, i, n, acc)
+                end
+            else
+                inline_scan(cs, i + 1, n, acc + "*")
+            end
+        elif c == "["
+            inline_link(cs, i, n, acc)
+        else
+            inline_scan(cs, i + 1, n, acc + escape_char(c))
+        end
+    end
+end
+
+# 反斜杠转义：下一个字符按字面输出（仍做 HTML 转义；越界时输出 '\'）
+fn escape_after_backslash(cs: List<String>, i: Int, n: Int) -> String
+    if i + 1 < n
+        escape_char(list_get(cs, i + 1))
+    else
+        "\\"
+    end
+end
+
+fn inline_code(cs: List<String>, i: Int, n: Int, acc: String) -> String
+    let close = chars_find(cs, "`", i + 1, n)
+    if close == -1
+        inline_scan(cs, i + 1, n, acc + "`")
+    else
+        let body = chars_join(cs, i + 1, close, "")
+        inline_scan(cs, close + 1, n, acc + "<code>" + html_escape(body) + "</code>")
+    end
+end
+
+fn inline_bold(cs: List<String>, i: Int, n: Int, acc: String) -> String
+    let close = chars_find2(cs, "*", "*", i + 2, n)
+    if close == -1
+        inline_scan(cs, i + 1, n, acc + "*")
+    else
+        let inner = render_inline_range(cs, i + 2, close)
+        inline_scan(cs, close + 2, n, acc + "<strong>" + inner + "</strong>")
+    end
+end
+
+fn inline_italic(cs: List<String>, i: Int, n: Int, acc: String) -> String
+    let close = chars_find(cs, "*", i + 1, n)
+    if close == -1
+        inline_scan(cs, i + 1, n, acc + "*")
+    else
+        let inner = render_inline_range(cs, i + 1, close)
+        inline_scan(cs, close + 1, n, acc + "<em>" + inner + "</em>")
+    end
+end
+
+fn inline_link(cs: List<String>, i: Int, n: Int, acc: String) -> String
+    let mid = chars_find2(cs, "]", "(", i + 1, n)
+    if mid == -1
+        inline_scan(cs, i + 1, n, acc + "[")
+    else
+        let close = chars_find(cs, ")", mid + 2, n)
+        if close == -1
+            inline_scan(cs, i + 1, n, acc + "[")
+        else
+            let text = render_inline_range(cs, i + 1, mid)
+            let url = chars_join(cs, mid + 2, close, "")
+            let tag = "<a href=\"" + html_escape(url) + "\">" + text + "</a>"
+            inline_scan(cs, close + 1, n, acc + tag)
+        end
+    end
+end
+
+# ============================================================
+# 四、块级 markdown（递归下降：标题/段落/列表/代码块/引用/水平线）
+# ============================================================
+
+# ATX 标题：返回标题级别（1-6），非标题返回 0
+fn heading_level(line: String) -> Int
+    if starts_with(line, "###### ")
+        6
+    elif starts_with(line, "##### ")
+        5
+    elif starts_with(line, "#### ")
+        4
+    elif starts_with(line, "### ")
+        3
+    elif starts_with(line, "## ")
+        2
+    elif starts_with(line, "# ")
+        1
+    else
+        0
+    end
+end
+
+# 无序列表项前缀（"- " 或 "* "）长度，非列表项返回 0
+fn ul_item_prefix(line: String) -> Int
+    if starts_with(line, "- ")
+        2
+    elif starts_with(line, "* ")
+        2
+    else
+        0
+    end
+end
+
+# 有序列表项 "N. " 前缀长度（N 为 1 位以上数字），非列表项返回 0
+fn ol_item_prefix_scan(cs: List<String>, i: Int, n: Int, digits: Int) -> Int
+    if i < n
+        let c = list_get(cs, i)
+        if c == "0" or c == "1" or c == "2" or c == "3" or c == "4" or c == "5" or c == "6" or c == "7" or c == "8" or c == "9"
+            ol_item_prefix_scan(cs, i + 1, n, digits + 1)
+        elif c == "."
+            if i + 1 < n
+                if list_get(cs, i + 1) == " "
+                    if digits >= 1
+                        digits + 2
+                    else
+                        0
+                    end
+                else
+                    0
+                end
+            else
+                0
+            end
+        else
+            0
+        end
+    else
+        0
+    end
+end
+
+fn ol_item_prefix(line: String) -> Int
+    let cs = chars_of(line)
+    ol_item_prefix_scan(cs, 0, len(line), 0)
+end
+
+# 行首新块判定（段落收集的终止条件）
+fn is_block_start(line: String) -> Bool
+    if trim(line) == ""
+        True
+    elif heading_level(line) > 0
+        True
+    elif starts_with(line, "```")
+        True
+    elif line == "---" or line == "***"
+        True
+    elif starts_with(line, ">")
+        True
+    elif ul_item_prefix(line) > 0
+        True
+    else
+        ol_item_prefix(line) > 0
+    end
+end
+
+# 主题分割线：恰好三个 - 或 *（更长也接受为 hr）
+fn is_hr(line: String) -> Bool
+    line == "---" or line == "***" or line == "----" or line == "*****"
+end
+
+# 在行列表 [start, len) 内找恰好等于 s 的行下标，找不到返回 -1
+fn find_line(ls: List<String>, s: String, start: Int) -> Int
+    if start >= list_length(ls)
+        -1
+    elif list_get(ls, start) == s
+        start
+    else
+        find_line(ls, s, start + 1)
+    end
+end
+
+# 行区间收集为新列表（倒序 cons 再反转）
+fn sub_lines(ls: List<String>, start: Int, to: Int) -> List<String>
+    sub_lines_rev(ls, start, to, list_empty())
+end
+
+fn sub_lines_rev(ls: List<String>, start: Int, to: Int, acc: List<String>) -> List<String>
+    if start >= to
+        reverse_list(acc, list_empty())
+    else
+        sub_lines_rev(ls, start + 1, to, list_cons(list_get(ls, start), acc))
+    end
+end
+
+fn reverse_list(xs: List<String>, acc: List<String>) -> List<String>
+    if list_is_empty(xs)
+        acc
+    else
+        reverse_list(list_tail(xs), list_cons(list_head(xs), acc))
+    end
+end
+
+# 块级渲染主循环（递归下降，acc 累加 HTML）
+fn render_blocks_at(ls: List<String>, i: Int, acc: String) -> String
+    let n = list_length(ls)
+    if i >= n
+        acc
+    else
+        let line = list_get(ls, i)
+        if trim(line) == ""
+            render_blocks_at(ls, i + 1, acc)
+        else
+            let h = heading_level(line)
+            if h > 0
+                let text = slice(line, h + 1, len(line))
+                render_blocks_at(ls, i + 1, acc + "<h" + int_to_string(h) + ">" + render_inline(text) + "</h" + int_to_string(h) + ">\n")
+            elif starts_with(line, "```")
+                render_code_block(ls, i, acc)
+            elif is_hr(line)
+                render_blocks_at(ls, i + 1, acc + "<hr>\n")
+            elif starts_with(line, ">")
+                render_blockquote(ls, i, acc)
+            elif ul_item_prefix(line) > 0
+                render_ul_list(ls, i, acc)
+            elif ol_item_prefix(line) > 0
+                render_ol_list(ls, i, acc)
+            else
+                render_paragraph(ls, i, acc)
+            end
+        end
+    end
+end
+
+# 代码围栏：```lang ... ```（语言标注进 class；未闭合取到文件尾）
+fn render_code_block(ls: List<String>, i: Int, acc: String) -> String
+    let n = list_length(ls)
+    let first = list_get(ls, i)
+    let lang = trim(slice(first, 3, len(first)))
+    let close = find_line(ls, "```", i + 1)
+    let end_line = if close == -1
+        n
+    else
+        close
+    end
+    let code = lines_join(ls, i + 1, end_line, "\n", "")
+    let tag = if lang == ""
+        "<pre><code>" + html_escape(code) + "</code></pre>\n"
+    else
+        "<pre><code class=\"language-" + html_escape(lang) + "\">" + html_escape(code) + "</code></pre>\n"
+    end
+    if close == -1
+        acc + tag
+    else
+        render_blocks_at(ls, close + 1, acc + tag)
+    end
+end
+
+# 引用块：连续 > 行剥前缀后递归块级渲染
+fn render_blockquote(ls: List<String>, i: Int, acc: String) -> String
+    let n = list_length(ls)
+    let inner = collect_quote_stripped(ls, i, n, list_empty())
+    let quoted = render_blocks_at(inner, 0, "")
+    let next = collect_quote_end(ls, i, n)
+    render_blocks_at(ls, next, acc + "<blockquote>\n" + quoted + "</blockquote>\n")
+end
+
+# 收集连续 > 行（剥掉 ">" 与一个可选空格），返回去前缀行列表
+fn collect_quote_stripped(ls: List<String>, i: Int, n: Int, acc: List<String>) -> List<String>
+    if i >= n
+        reverse_list(acc, list_empty())
+    else
+        let line = list_get(ls, i)
+        if starts_with(line, ">")
+            collect_quote_stripped(ls, i + 1, n, list_cons(strip_quote_mark(line), acc))
+        else
+            reverse_list(acc, list_empty())
+        end
+    end
+end
+
+fn collect_quote_end(ls: List<String>, i: Int, n: Int) -> Int
+    if i >= n
+        n
+    elif starts_with(list_get(ls, i), ">")
+        collect_quote_end(ls, i + 1, n)
+    else
+        i
+    end
+end
+
+fn strip_quote_mark(line: String) -> String
+    let rest = slice(line, 1, len(line))
+    if starts_with(rest, " ")
+        slice(rest, 1, len(rest))
+    else
+        rest
+    end
+end
+
+# 无序列表：连续列表项
+fn render_ul_list(ls: List<String>, i: Int, acc: String) -> String
+    let n = list_length(ls)
+    let items = collect_items(ls, i, n, ul_item_prefix(list_get(ls, i)), list_empty())
+    let next = collect_items_end(ls, i, n, ul_item_prefix(list_get(ls, i)))
+    let html = "<ul>\n" + items_html(items) + "</ul>\n"
+    render_blocks_at(ls, next, acc + html)
+end
+
+# 有序列表：连续列表项（前缀长度随每行各自判定）
+fn render_ol_list(ls: List<String>, i: Int, acc: String) -> String
+    let n = list_length(ls)
+    let items = collect_items(ls, i, n, -1, list_empty())
+    let next = collect_items_end(ls, i, n, -1)
+    let html = "<ol>\n" + items_html(items) + "</ol>\n"
+    render_blocks_at(ls, next, acc + html)
+end
+
+# 收集连续列表项文本（prefix_len>0 按定长剥前缀；-1 表示有序列表逐行判定）
+fn collect_items(ls: List<String>, i: Int, n: Int, prefix_len: Int, acc: List<String>) -> List<String>
+    if i >= n
+        reverse_list(acc, list_empty())
+    else
+        let line = list_get(ls, i)
+        if prefix_len > 0
+            if ul_item_prefix(line) > 0
+                collect_items(ls, i + 1, n, prefix_len, list_cons(slice(line, prefix_len, len(line)), acc))
+            else
+                reverse_list(acc, list_empty())
+            end
+        elif prefix_len == -1
+            let p = ol_item_prefix(line)
+            if p > 0
+                collect_items(ls, i + 1, n, prefix_len, list_cons(slice(line, p, len(line)), acc))
+            else
+                reverse_list(acc, list_empty())
+            end
+        else
+            reverse_list(acc, list_empty())
+        end
+    end
+end
+
+fn collect_items_end(ls: List<String>, i: Int, n: Int, prefix_len: Int) -> Int
+    if i >= n
+        n
+    else
+        let line = list_get(ls, i)
+        let matched = if prefix_len > 0
+            ul_item_prefix(line) > 0
+        elif prefix_len == -1
+            ol_item_prefix(line) > 0
+        else
+            False
+        end
+        if matched
+            collect_items_end(ls, i + 1, n, prefix_len)
+        else
+            i
+        end
+    end
+end
+
+fn items_html(items: List<String>) -> String
+    items_html_at(items, 0, list_length(items), "")
+end
+
+fn items_html_at(items: List<String>, i: Int, n: Int, acc: String) -> String
+    if i >= n
+        acc
+    else
+        items_html_at(items, i + 1, n, acc + "<li>" + render_inline(list_get(items, i)) + "</li>\n")
+    end
+end
+
+# 段落：收集到空行或下一块起点，行以 \n 连接
+fn render_paragraph(ls: List<String>, i: Int, acc: String) -> String
+    let n = list_length(ls)
+    let end_idx = paragraph_end(ls, i, n)
+    let text = lines_join(ls, i, end_idx, "\n", "")
+    render_blocks_at(ls, end_idx, acc + "<p>" + render_inline(text) + "</p>\n")
+end
+
+fn paragraph_end(ls: List<String>, i: Int, n: Int) -> Int
+    if i >= n
+        n
+    elif is_block_start(list_get(ls, i))
+        i
+    else
+        paragraph_end(ls, i + 1, n)
+    end
+end
+
+fn render_blocks(content: String) -> String
+    render_blocks_at(split(content, "\n"), 0, "")
+end
+
+# ============================================================
+# 五、front-matter（--- 包围的 key: value 头部）
+# ============================================================
+
+# 返回 (剩余正文行, front-matter Map)；无闭合 --- 时整体视为正文
+fn parse_front_matter(lines: List<String>) -> (List<String>, Map<String>)
+    let n = list_length(lines)
+    if n > 0
+        if list_get(lines, 0) == "---"
+            let close = find_line(lines, "---", 1)
+            if close == -1
+                (lines, map_empty())
+            else
+                (sub_lines(lines, close + 1, n), parse_kv_lines(lines, 1, close, map_empty()))
+            end
+        else
+            (lines, map_empty())
+        end
+    else
+        (lines, map_empty())
+    end
+end
+
+# "key: value" 逐行入 Map（首个冒号分割；无冒号的行跳过）
+fn parse_kv_lines(lines: List<String>, i: Int, close: Int, m: Map<String>) -> Map<String>
+    if i >= close
+        m
+    else
+        let line = list_get(lines, i)
+        let sep = chars_find(chars_of(line), ":", 0, len(line))
+        if sep <= 0
+            parse_kv_lines(lines, i + 1, close, m)
+        else
+            let key = trim(slice(line, 0, sep))
+            let val = trim(slice(line, sep + 1, len(line)))
+            map_set(m, key, val)
+            parse_kv_lines(lines, i + 1, close, m)
+        end
+    end
+end
+
+# Map 取字符串值，缺键回落默认
+fn fm_get(m: Map<String>, key: String, default: String) -> String
+    match map_get(m, key)
+        Some(v) => v
+        None => default
+    end
+end
+
+# ============================================================
+# 六、模板（{{ var }} 变量替换；紧凑形式 {{var}} 同样支持）
+# ============================================================
+
+fn apply_template(tpl: String, title: String, content: String, site_name: String, date: String) -> String
+    let t1 = replace(tpl, "{{ title }}", title)
+    let t2 = replace(t1, "{{title}}", title)
+    let t3 = replace(t2, "{{ content }}", content)
+    let t4 = replace(t3, "{{content}}", content)
+    let t5 = replace(t4, "{{ site_name }}", site_name)
+    let t6 = replace(t5, "{{site_name}}", site_name)
+    let t7 = replace(t6, "{{ date }}", date)
+    let t8 = replace(t7, "{{date}}", date)
+    t8
+end
+
+# 缺省模板：layouts/<name>.html 不存在时的兜底
+fn fallback_template() -> String
+    "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>{{ title }} - {{ site_name }}</title>\n</head>\n<body>\n<h1>{{ title }}</h1>\n{{ content }}\n<footer>{{ date }}</footer>\n</body>\n</html>\n"
+end
+
+# ============================================================
+# 七、路径工具（配置路径解析到站点根；\ 归一为 /）
+# ============================================================
+
+fn normalize_sep(path: String) -> String
+    replace(path, "\\", "/")
+end
+
+# 目录部分：去掉最后一段；无分隔符返回 "."
+fn dir_of(path: String) -> String
+    let parts = split(normalize_sep(path), "/")
+    dir_parts_at(parts, 0, list_length(parts) - 1, "")
+end
+
+fn dir_parts_at(parts: List<String>, i: Int, last: Int, acc: String) -> String
+    if last <= 0
+        "."
+    elif i >= last
+        acc
+    elif acc == ""
+        dir_parts_at(parts, i + 1, last, list_get(parts, i))
+    else
+        dir_parts_at(parts, i + 1, last, acc + "/" + list_get(parts, i))
+    end
+end
+
+fn join_path(a: String, b: String) -> String
+    a + "/" + b
+end
+
+# 输出文件名：.md 尾缀替换为 .html；无 .md 尾缀直接补 .html
+fn html_name(page: String) -> String
+    if ends_with(page, ".md")
+        slice(page, 0, len(page) - 3) + ".html"
+    else
+        page + ".html"
+    end
+end
+
+# 文件名兜底 title：去 .md 尾缀
+fn title_from_filename(page: String) -> String
+    if ends_with(page, ".md")
+        slice(page, 0, len(page) - 3)
+    else
+        page
+    end
+end
+
+# ============================================================
+# 八、配置（缺字段用默认值 + 提示，不炸）
+# ============================================================
+
+# 键存在性：json_parse 得动态 Record，无 record_has 内建；
+# 以 stringify 后包含 "key" 判定（site.json 小配置面足够可靠）
+fn json_has_key(cfg: _Any, key: String) -> Bool
+    contains(json_stringify(cfg), "\"" + key + "\"")
+end
+
+# ============================================================
+# 九、单页构建与站点遍历
+# ============================================================
+
+# 构建单页：读 md → front-matter → 块级+行内渲染 → 模板 → 写出
+# 返回 True = 已写出；False = 源缺失跳过
+fn build_page(site_root: String, src_dir: String, out_dir: String, page: String, site_name: String) -> Bool ! [IO]
+    let src_path = join_path(join_path(site_root, src_dir), page)
+    if file_exists(src_path)
+        let content = replace(file_read(src_path), "\r\n", "\n")
+        let parsed = parse_front_matter(split(content, "\n"))
+        let body = parsed.0
+        let fm = parsed.1
+        let fm_title = fm_get(fm, "title", "")
+        let title = if fm_title == ""
+            title_from_filename(page)
+        else
+            fm_title
+        end
+        let date = fm_get(fm, "date", "")
+        let template_name = fm_get(fm, "template", "default")
+        let html_body = render_blocks_at(body, 0, "")
+        let tpl = load_template(site_root, template_name)
+        let page_html = apply_template(tpl, html_escape(title), html_body, html_escape(site_name), html_escape(date))
+        let out_path = join_path(join_path(site_root, out_dir), html_name(page))
+        file_write(out_path, page_html)
+        println("built " + src_path + " -> " + out_path)
+        True
+    else
+        println("[ssg] skip (missing source): " + src_path)
+        False
+    end
+end
+
+# 加载 layouts/<name>.html；不存在回落内建模板并提示
+fn load_template(site_root: String, name: String) -> String ! [IO]
+    let path = join_path(join_path(site_root, "layouts"), name + ".html")
+    if file_exists(path)
+        file_read(path)
+    else
+        println("[ssg] layout not found, fallback to builtin: " + path)
+        fallback_template()
+    end
+end
+
+# 遍历 pages 清单逐页构建；返回实际写出的页数
+fn build_pages(site_root: String, src_dir: String, out_dir: String, pages: List<String>, site_name: String) -> Int ! [IO]
+    build_pages_loop(site_root, src_dir, out_dir, pages, 0, list_length(pages), 0, site_name)
+end
+
+fn build_pages_loop(site_root: String, src_dir: String, out_dir: String, pages: List<String>, i: Int, n: Int, done: Int, site_name: String) -> Int ! [IO]
+    if i >= n
+        done
+    else
+        let wrote = build_page(site_root, src_dir, out_dir, list_get(pages, i), site_name)
+        if wrote
+            build_pages_loop(site_root, src_dir, out_dir, pages, i + 1, n, done + 1, site_name)
+        else
+            build_pages_loop(site_root, src_dir, out_dir, pages, i + 1, n, done, site_name)
+        end
+    end
+end
+
+# ============================================================
+# 十、入口：argv[1] = 配置路径（缺省 site.json 并提示）
+# ============================================================
+
+fn main() -> Unit ! [IO]
+    let argv = args()
+    let cfg_path = if list_length(argv) >= 2
+        list_get(argv, 1)
+    else
+        println("[ssg] no config path given, defaulting to site.json")
+        "site.json"
+    end
+    if file_exists(cfg_path)
+        let cfg = json_parse(file_read(cfg_path))
+        let site_root = dir_of(cfg_path)
+        let site_name = config_str(cfg, "name", "My Site", "name missing, using default")
+        let src_dir = config_str(cfg, "src", "content", "src missing, using default")
+        let out_dir = config_str(cfg, "out", "dist", "out missing, using default")
+        if json_has_key(cfg, "pages")
+            let out_root = join_path(site_root, out_dir)
+            if file_exists(out_root)
+                let pages = cfg.pages
+                let built = build_pages(site_root, src_dir, out_dir, pages, site_name)
+                println("[ssg] done: " + int_to_string(built) + " page(s) -> " + out_root)
+            else
+                println("[ssg] output directory does not exist: " + out_root)
+                println("[ssg] create it first (Lom file builtins cannot mkdir): mkdir -p " + out_root)
+            end
+        else
+            println("[ssg] config has no \"pages\" array — nothing to build")
+            println("[ssg] note: Lom file builtins have no directory listing, so site.json must list pages explicitly")
+        end
+    else
+        println("[ssg] config not found: " + cfg_path)
+        println("[ssg] usage: lom build.lom -- <site.json>")
+    end
+    ()
+end
+
+# 配置字符串字段：存在返回值，缺失返回默认并提示
+fn config_str(cfg: _Any, key: String, default: String, hint: String) -> String ! [IO]
+    if json_has_key(cfg, key)
+        record_field(cfg, key)
+    else
+        println("[ssg] " + hint)
+        default
+    end
+end
+
+# cfg 动态字段的安全取值（键已由 json_has_key 证实存在）
+fn record_field(rec: _Any, key: String) -> String
+    if key == "name"
+        rec.name
+    elif key == "src"
+        rec.src
+    elif key == "out"
+        rec.out
+    else
+        ""
+    end
+end

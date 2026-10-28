@@ -1,0 +1,6 @@
+{
+  "name": "Lom SSG Example",
+  "src": "content",
+  "out": "dist",
+  "pages": ["index.md", "about.md", "markdown-tour.md"]
+}
