@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Markdown 子集导览 - Lom SSG Example</title>
+</head>
+<body>
+  <header><a href="index.html">Lom SSG Example</a></header>
+  <main>
+<h1>子集导览：中文标题</h1>
+<p>这是一个中文内容页，用于验证 UTF-8 全链路往返：仓颉、熵、燚、「直角引号」与全角标点——逐字保留。</p>
+<h2>行内元素</h2>
+<p>行内 <code>code</code>、<strong>粗体</strong>、<em>斜体</em> 与 <a href="https://example.com/zh">链接</a> 混排。
+反斜杠转义：*不斜体* 与 _下划线_。</p>
+<h2>块级元素</h2>
+<h3>无序列表</h3>
+<ul>
+<li>第一项</li>
+<li>第二项</li>
+</ul>
+<h3>有序列表</h3>
+<ol>
+<li>步骤一</li>
+<li>步骤二</li>
+<li>步骤三</li>
+</ol>
+<h3>引用</h3>
+<blockquote>
+<p>引用块内可以有 <strong>粗体</strong> 与 <code>code</code>。
+第二行引用。</p>
+</blockquote>
+<h3>代码块</h3>
+<pre><code class="language-lom">fn main() -&gt; Unit
+    println(&quot;你好，世界&quot;)
+end</code></pre>
+<h3>水平线</h3>
+<hr>
+<h2>HTML 转义</h2>
+<p>下面的内容必须被转义而不是原样输出：<code>&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;</code>、
+直接出现的 &lt;em&gt;伪标签&lt;/em&gt;、a &amp; b、&quot;双引号&quot;。</p>
+
+  </main>
+  <footer>2026-10-28</footer>
+</body>
+</html>

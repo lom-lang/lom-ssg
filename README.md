@@ -88,6 +88,26 @@ mkdir -p example/dist
 lom build.lom -- example/site.json
 ```
 
+## Tests
+
+`tests/assert.py` is the project's local gate: 71 HTML-conformance
+assertions covering the full markdown subset (headings, lists, fences,
+inline quartet, backslash escapes, HTML escaping), the CJK round trip,
+front-matter → template wiring, every config/missing-file fallback path,
+the v0.1.1 review fixes (hr variants, paragraph termination, placeholder
+non-re-expansion), and a byte-exact reconciliation of the example site
+against the golden files in `tests/golden/`.
+
+```bash
+python tests/assert.py     # expects the lom toolchain at ../lom/target/release/lom.exe
+                           # (override with the LOM env var)
+```
+
+All probe fixtures are generated in a system temp dir and cleaned up, so
+the run leaves no files behind. There is no CI pipeline for this repo —
+the assertion set is the local verification gate; run it before cutting a
+release.
+
 ## Boundaries
 
 Honest scope limits of this MVP, several of them forced by Lom's frozen
