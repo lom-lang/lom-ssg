@@ -5,7 +5,7 @@ an LLM-repair-native dynamic language with a frozen surface of 20 keywords and
 43 builtins. lom-ssg grew naturally out of what Lom is demonstrably good at —
 recursive-descent parsing and tree-to-string transformation — so its whole
 pipeline (front-matter, block-level markdown, inline markdown, template
-substitution) lives in a single 786-line Lom file with zero dependencies
+substitution) lives in a single 895-line Lom file with zero dependencies
 beyond the language's builtin modules.
 
 ## Usage
@@ -34,7 +34,7 @@ Block-level:
 | `1. item` (any digit run) | `<ol><li>` |
 | ` ```lang ` fenced block | `<pre><code class="language-lang">` |
 | `> quoted` lines | `<blockquote>` (contents rendered recursively) |
-| `---` / `***` | `<hr>` |
+| `---` / `***` (unbroken run of 3+) | `<hr>` |
 
 Inline: `` `code` ``, `**bold**`, `*italic*`, `[text](url)`, and backslash
 escapes (`\_` prints a literal `_`; any `\x` prints a literal `x`).
@@ -70,9 +70,11 @@ A page without `title` falls back to its file name.
 ## Layout / template
 
 Templates live in `layouts/<name>.html` next to the config file. The
-front-matter `template` key selects one (`default` if absent or unparsable).
-Four variables are substituted: `{{ title }}`, `{{ content }}`,
-`{{ site_name }}`, `{{ date }}` (tight `{{title}}` forms also work). If the
+front-matter `template` key selects one (`default` if absent). Four variables
+are substituted in a single pass: `{{ title }}`, `{{ content }}`,
+`{{ site_name }}`, `{{ date }}` — tight `{{title}}` and extra-spaced forms
+also work. Substituted values are inserted verbatim: a literal `{{ ... }}`
+written in page content or a front-matter title is never re-expanded. If the
 layout file is missing the tool prints a notice and falls back to a minimal
 built-in template.
 
@@ -99,8 +101,9 @@ builtin surface:
   no setext headings, no indented code blocks.
 - Fenced code blocks must close with a bare ` ``` ` line (trailing spaces
   break detection); an unterminated fence consumes the rest of the file.
-- `hr` recognizes exactly `---`/`***` (plus 4-char variants), not arbitrary
-  runs.
+- `hr` recognizes unbroken runs of three or more `-` or `*` (e.g. `-----`);
+  spaced or mixed runs like `- - -` or `-*-*` are not `hr` (`- - -` parses as
+  a list item).
 - Inline parsing is non-nesting-greedy in the CommonMark sense: `**a*b**`
   renders as bold containing an asterisk; emphasis does not span list items.
 - Index page generation is not implemented; no `index` key is honored in

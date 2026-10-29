@@ -14,7 +14,7 @@ from env import { args }
 from file import { file_read, file_write, file_exists }
 from json import { json_parse, json_stringify }
 from list import { list_empty, list_length, list_get, list_is_empty, list_head, list_tail, list_cons }
-from map import { map_empty, map_set, map_get, map_has }
+from map import { map_empty, map_set, map_get }
 from string import { len, int_to_string, trim, split, contains, replace, starts_with, ends_with }
 from io import { println }
 
@@ -290,7 +290,7 @@ fn is_block_start(line: String) -> Bool
         True
     elif starts_with(line, "```")
         True
-    elif line == "---" or line == "***"
+    elif is_hr(line)
         True
     elif starts_with(line, ">")
         True
@@ -301,9 +301,32 @@ fn is_block_start(line: String) -> Bool
     end
 end
 
-# 主题分割线：恰好三个 - 或 *（更长也接受为 hr）
+# 主题分割线：纯 "-" 或纯 "*" 连续 3 个及以上（不允许混排与内部空格）
 fn is_hr(line: String) -> Bool
-    line == "---" or line == "***" or line == "----" or line == "*****"
+    let cs = chars_of(line)
+    let n = list_length(cs)
+    if n >= 3
+        if list_get(cs, 0) == "-"
+            hr_all_chars(cs, "-", 0, n)
+        elif list_get(cs, 0) == "*"
+            hr_all_chars(cs, "*", 0, n)
+        else
+            False
+        end
+    else
+        False
+    end
+end
+
+# cs 的 [i, n) 区间是否全为字符 c
+fn hr_all_chars(cs: List<String>, c: String, i: Int, n: Int) -> Bool
+    if i >= n
+        True
+    elif list_get(cs, i) == c
+        hr_all_chars(cs, c, i + 1, n)
+    else
+        False
+    end
 end
 
 # 在行列表 [start, len) 内找恰好等于 s 的行下标，找不到返回 -1
@@ -359,9 +382,9 @@ fn render_blocks_at(ls: List<String>, i: Int, acc: String) -> String
             elif starts_with(line, ">")
                 render_blockquote(ls, i, acc)
             elif ul_item_prefix(line) > 0
-                render_ul_list(ls, i, acc)
+                render_list(ls, i, acc, 2, "ul")
             elif ol_item_prefix(line) > 0
-                render_ol_list(ls, i, acc)
+                render_list(ls, i, acc, -1, "ol")
             else
                 render_paragraph(ls, i, acc)
             end
@@ -435,21 +458,12 @@ fn strip_quote_mark(line: String) -> String
     end
 end
 
-# 无序列表：连续列表项
-fn render_ul_list(ls: List<String>, i: Int, acc: String) -> String
+# 列表：连续列表项（无序 prefix_len=2 定长剥前缀；有序 -1 逐行判定），tag 为 "ul"/"ol"
+fn render_list(ls: List<String>, i: Int, acc: String, prefix_len: Int, tag: String) -> String
     let n = list_length(ls)
-    let items = collect_items(ls, i, n, ul_item_prefix(list_get(ls, i)), list_empty())
-    let next = collect_items_end(ls, i, n, ul_item_prefix(list_get(ls, i)))
-    let html = "<ul>\n" + items_html(items) + "</ul>\n"
-    render_blocks_at(ls, next, acc + html)
-end
-
-# 有序列表：连续列表项（前缀长度随每行各自判定）
-fn render_ol_list(ls: List<String>, i: Int, acc: String) -> String
-    let n = list_length(ls)
-    let items = collect_items(ls, i, n, -1, list_empty())
-    let next = collect_items_end(ls, i, n, -1)
-    let html = "<ol>\n" + items_html(items) + "</ol>\n"
+    let items = collect_items(ls, i, n, prefix_len, list_empty())
+    let next = collect_items_end(ls, i, n, prefix_len)
+    let html = "<" + tag + ">\n" + items_html(items) + "</" + tag + ">\n"
     render_blocks_at(ls, next, acc + html)
 end
 
@@ -582,19 +596,114 @@ fn fm_get(m: Map<String>, key: String, default: String) -> String
 end
 
 # ============================================================
-# 六、模板（{{ var }} 变量替换；紧凑形式 {{var}} 同样支持）
+# 六、模板（{{ var }} 变量替换；紧凑 {{var}} 与内侧任意空格同支持）
 # ============================================================
 
+# 单遍扫描替换：值文本原样插入、不再被当作占位符二次展开
+# （顺序 replace 的旧实现会把 title/content 中出现的 {{ site_name }} 等再次替换）
 fn apply_template(tpl: String, title: String, content: String, site_name: String, date: String) -> String
-    let t1 = replace(tpl, "{{ title }}", title)
-    let t2 = replace(t1, "{{title}}", title)
-    let t3 = replace(t2, "{{ content }}", content)
-    let t4 = replace(t3, "{{content}}", content)
-    let t5 = replace(t4, "{{ site_name }}", site_name)
-    let t6 = replace(t5, "{{site_name}}", site_name)
-    let t7 = replace(t6, "{{ date }}", date)
-    let t8 = replace(t7, "{{date}}", date)
-    t8
+    template_scan(chars_of(tpl), 0, len(tpl), "", title, content, site_name, date)
+end
+
+fn template_scan(cs: List<String>, i: Int, n: Int, acc: String, title: String, content: String, site_name: String, date: String) -> String
+    if i >= n
+        acc
+    elif list_get(cs, i) == "{"
+        let m = template_var_at(cs, i, n)
+        if m.0 >= 0
+            template_scan(cs, m.1, n, acc + template_value(m.0, title, content, site_name, date), title, content, site_name, date)
+        else
+            template_scan(cs, i + 1, n, acc + "{", title, content, site_name, date)
+        end
+    else
+        template_scan(cs, i + 1, n, acc + list_get(cs, i), title, content, site_name, date)
+    end
+end
+
+# 在 cs 的 [i, n) 尝试匹配 "{{ 名称 }}"（内侧允许任意空格，含紧凑形式）；
+# 成功返回 (变量编号 0-3, 占位符结束下标)，失败返回 (-1, i)
+fn template_var_at(cs: List<String>, i: Int, n: Int) -> (Int, Int)
+    if i + 1 < n
+        if list_get(cs, i) == "{"
+            if list_get(cs, i + 1) == "{"
+                let m = match_var_name(cs, skip_spaces(cs, i + 2, n), n)
+                if m.0 >= 0
+                    let t = skip_spaces(cs, m.1, n)
+                    if t + 1 < n
+                        if list_get(cs, t) == "}"
+                            if list_get(cs, t + 1) == "}"
+                                (m.0, t + 2)
+                            else
+                                (-1, i)
+                            end
+                        else
+                            (-1, i)
+                        end
+                    else
+                        (-1, i)
+                    end
+                else
+                    (-1, i)
+                end
+            else
+                (-1, i)
+            end
+        else
+            (-1, i)
+        end
+    else
+        (-1, i)
+    end
+end
+
+# 匹配四个变量名之一：title=0 / content=1 / site_name=2 / date=3
+fn match_var_name(cs: List<String>, i: Int, n: Int) -> (Int, Int)
+    if match_chars_at(cs, i, n, chars_of("title"), 0)
+        (0, i + len("title"))
+    elif match_chars_at(cs, i, n, chars_of("content"), 0)
+        (1, i + len("content"))
+    elif match_chars_at(cs, i, n, chars_of("site_name"), 0)
+        (2, i + len("site_name"))
+    elif match_chars_at(cs, i, n, chars_of("date"), 0)
+        (3, i + len("date"))
+    else
+        (-1, i)
+    end
+end
+
+# pat 是否逐字符匹配 cs 的 [i, n) 前缀
+fn match_chars_at(cs: List<String>, i: Int, n: Int, pat: List<String>, j: Int) -> Bool
+    if j >= list_length(pat)
+        True
+    elif i + j >= n
+        False
+    elif list_get(cs, i + j) == list_get(pat, j)
+        match_chars_at(cs, i, n, pat, j + 1)
+    else
+        False
+    end
+end
+
+fn skip_spaces(cs: List<String>, i: Int, n: Int) -> Int
+    if i >= n
+        i
+    elif list_get(cs, i) == " "
+        skip_spaces(cs, i + 1, n)
+    else
+        i
+    end
+end
+
+fn template_value(vid: Int, title: String, content: String, site_name: String, date: String) -> String
+    if vid == 0
+        title
+    elif vid == 1
+        content
+    elif vid == 2
+        site_name
+    else
+        date
+    end
 end
 
 # 缺省模板：layouts/<name>.html 不存在时的兜底
